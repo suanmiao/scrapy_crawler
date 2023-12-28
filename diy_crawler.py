@@ -5,6 +5,7 @@ import csv
 import threading
 from queue import Queue
 from urllib.parse import urlparse
+import argparse
 
 # set logger format to include day and hour and minute and second
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%m/%d %I:%M:%S %p') 
@@ -26,6 +27,7 @@ from urllib.parse import urljoin, urlparse
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+from urllib.parse import urlparse, urlunparse
 import re
 
 
@@ -42,6 +44,13 @@ def get_base_url(url):
     base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     return base_url
 
+
+def get_full_url(url):
+    # remove the fragments from the url
+    parsed_url = urlparse(url)
+    # Reconstruct the URL without the fragment
+    return urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.params, parsed_url.query, ''))
+
 def extract_urls(html_content, base_url):
     soup = BeautifulSoup(html_content, 'html.parser')
     urls = set()
@@ -52,11 +61,13 @@ def extract_urls(html_content, base_url):
 
         # Construct full URL from relative path
         full_url = urljoin(base_url, href)
+        # Remove the fragment from the URL
+        full_url = get_full_url(full_url)
 
         # Parse the URL to check its components
         parsed_url = urlparse(full_url)
         if parsed_url.scheme not in ['http', 'https']:
-            logging.info(f"Skip url that's not HTTP or HTTPS {full_url}")
+            # logging.info(f"Skip url that's not HTTP or HTTPS {full_url}")
             continue  # Skip if it's not a HTTP or HTTPS URL
 
         # Check if the URL is in the allowed domain and contains valid substrings
@@ -71,15 +82,11 @@ class Scheduler:
         self.num_visiting_executors = 10 
         self.currently_visiting_lock = threading.Lock()
         for url in START_URLS:
+            print(f"Adding url {url} to queue")
             task_queue.put(url)
 
     def is_valid_url(self, url):
-        parsed_url = urlparse(url)
-        if parsed_url.netloc in ALLOWED_DOMAINS:
-            if any(substring in url for substring in VALID_SUBSTRINGS):
-                if not any(substring in url for substring in INVALID_SUBSTRINGS):
-                    return True
-        return False
+        return is_valid_url(url)
 
     def add_to_queue(self, url):
         if url not in visited_urls and self.is_valid_url(url):
@@ -143,13 +150,13 @@ def scrape_url_selenium(url):
 
 num_rows_added = 0
 
-def write_to_csv():
+def write_to_csv(output_file_name):
     global num_rows_added
     # if is mac os
     if os.uname().sysname == "Darwin":
-        file_name = "scraped_data.csv"
+        file_name = output_file_name 
     else:
-        file_name = "/databricks/driver/scraped_data.csv"
+        file_name = f"/databricks/driver/{output_file_name}"
     with csv_lock:
         with open(file_name, mode='a', newline='') as file:
             writer = csv.writer(file)
@@ -159,10 +166,11 @@ def write_to_csv():
                 writer.writerow([url, content])
 
 class Executor(threading.Thread):
-    def __init__(self, scheduler, *args, **kwargs):
+    def __init__(self, scheduler, output_file_name, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scheduler = scheduler
         self.is_visiting = False
+        self.output_file_name = output_file_name
 
     def run(self):
         global num_rows_added
@@ -189,16 +197,25 @@ class Executor(threading.Thread):
                     logging.info(f"Finished adding urls to queue, current queue size {task_queue.qsize()}, visited urls: {len(visited_urls)}, visiting size {self.scheduler.num_visiting_executors}, num rows added {num_rows_added}")
                     self.is_visiting = False
                     self.scheduler.check_and_set_shutdown()
-                    write_to_csv()
+                    write_to_csv(self.output_file_name)
             else:
                 # if task queue is empty, wait for 1 second
                 time.sleep(1)
+                # print(f"Waiting for 1 second, current queue size {task_queue.qsize()}, visited urls: {len(visited_urls)}, visiting size {self.scheduler.num_visiting_executors}, num rows added {num_rows_added}")
         logging.info(f"[Thread {thread_id}] Executor finished")
 
 def main():
+    parser = argparse.ArgumentParser(description='DIY Crawler')
+    parser.add_argument('--num_workers', type=int, default=150, help='Number of workers')
+    parser.add_argument('--output_file_name', type=str, default='output.csv', help='Output file name')
+    args = parser.parse_args()
+    # assert that the output file name is csv
+    assert args.output_file_name.endswith(".csv")
+    print(f"Number of workers: {args.num_workers}, output file name: {args.output_file_name}")
+
     scheduler = Scheduler()
     global executors
-    executors = [Executor(scheduler) for _ in range(180)]
+    executors = [Executor(scheduler, args.output_file_name) for _ in range(args.num_workers)]
 
     for ex in executors:
         ex.start()
