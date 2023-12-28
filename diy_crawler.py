@@ -20,13 +20,22 @@ visited_urls = set()
 task_queue = Queue()
 result_queue = Queue()
 csv_lock = threading.Lock()
-shutdown_event = threading.Event()
 
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+import re
+
+
+def is_valid_url(url):
+    parsed_url = urlparse(url)
+    if parsed_url.netloc in ALLOWED_DOMAINS:
+        if any(substring in url for substring in VALID_SUBSTRINGS):
+            if not any(substring in url for substring in INVALID_SUBSTRINGS):
+                return True
+    return False
 
 def get_base_url(url):
     parsed_url = urlparse(url)
@@ -37,7 +46,6 @@ def extract_urls(html_content, base_url):
     soup = BeautifulSoup(html_content, 'html.parser')
     urls = set()
 
-    num_urls = len(list(soup.find_all('a', href=True)))
     # Find all links in the HTML content
     for link in soup.find_all('a', href=True):
         href = link['href']
@@ -52,18 +60,15 @@ def extract_urls(html_content, base_url):
             continue  # Skip if it's not a HTTP or HTTPS URL
 
         # Check if the URL is in the allowed domain and contains valid substrings
-        if any(domain in parsed_url.netloc for domain in ALLOWED_DOMAINS) and any(valid_substr in full_url for valid_substr in VALID_SUBSTRINGS):
+        if is_valid_url(full_url) and full_url not in visited_urls:
             urls.add(full_url)
-        # else:
-        #     logging.info(f"Skip url that's not in allowed domain {full_url}, href {href}")
-
 
     return list(urls)
 
 class Scheduler:
     def __init__(self):
-        # self.currently_visiting = set()
-        self.num_visiting_executors = 0
+        # this number has to be initialized to non zero, otherwise the first executor will think that all executors are finished
+        self.num_visiting_executors = 10 
         self.currently_visiting_lock = threading.Lock()
         for url in START_URLS:
             task_queue.put(url)
@@ -84,8 +89,6 @@ class Scheduler:
     def check_and_set_shutdown(self):
         with self.currently_visiting_lock:
             self.num_visiting_executors = len([ex for ex in executors if ex.is_visiting])
-            if task_queue.empty() and all(not ex.is_visiting for ex in executors):
-                shutdown_event.set()
 
 def scrape_url_requests(url):
     thread_id = threading.get_ident()  # Get the current thread's ID
@@ -163,16 +166,16 @@ class Executor(threading.Thread):
 
     def run(self):
         global num_rows_added
-        # add a random wait between 0 to 10 seconds
+        # add a random wait between 0 to 30 seconds
         import random
         import time
-        time.sleep(random.random() * 10)
+        time.sleep(random.random() * 30)
 
         thread_id = threading.get_ident()  # Get the current thread's ID
         thread_id = str(thread_id)[-4:]
         logging.info(f"[Thread {thread_id}] Executor started")
 
-        while not shutdown_event.is_set():
+        while (task_queue.qsize() + self.scheduler.num_visiting_executors) > 0:
             if not task_queue.empty():
                 url = task_queue.get()
                 if self.scheduler.is_valid_url(url):
@@ -187,11 +190,15 @@ class Executor(threading.Thread):
                     self.is_visiting = False
                     self.scheduler.check_and_set_shutdown()
                     write_to_csv()
+            else:
+                # if task queue is empty, wait for 1 second
+                time.sleep(1)
+        logging.info(f"[Thread {thread_id}] Executor finished")
 
 def main():
     scheduler = Scheduler()
     global executors
-    executors = [Executor(scheduler) for _ in range(150)]
+    executors = [Executor(scheduler) for _ in range(180)]
 
     for ex in executors:
         ex.start()
