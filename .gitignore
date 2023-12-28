@@ -1,0 +1,4 @@
+.env
+.pyc
+output.csv
+scraped_data.csv
